@@ -1076,6 +1076,56 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 
 ---
 
+### Tool-call ids
+
+Every tool call this server answers with has its own ids: a `call_id` (OpenAI `tool_calls[].id`, Anthropic
+`tool_use` block `id`, Responses `function_call.call_id`) and, on the Responses API, an output-item `id`. Clients
+key their own bookkeeping on them - a call advertised, the call actually run, and the result reported back are the
+same call to a client only if all three carry the same id - so the server treats distinct ids as a rule it checks,
+not as something that happens to follow from how ids are generated.
+
+One `CallIds` registry per request (`serve/frontend.py`) issues them. It is seeded with every id the incoming
+conversation already names, and `new()` draws `call_` + 24 random hex digits (Responses items: `fc_`/`ctc_`/`msg_`/
+`rs_` + 32) until it has one it has not handed out before. So:
+
+- two calls in one answer always have different ids, including two calls of the same tool with the same arguments
+  (the id is a random draw, not a hash of the name, the arguments, the position in the turn, or the clock);
+- the id a call was announced with is the id in every later event of that call, and in the finished message - a
+  call is announced once and its id never changes mid-stream;
+- a later turn of the same conversation cannot reissue an id an earlier turn used, so a late or replayed result
+  cannot attach to the wrong call;
+- argument pieces are routed by call id, not by "whichever call was announced last": on the Responses API each
+  call's deltas go to the item announced for it (`Assembler.items`), on Chat Completions to the `tool_calls[].index`
+  its announcement created, on `/v1/messages` to the content block it was opened as. No item or block carries
+  another call's arguments;
+- each Responses output item keeps one `output_index` for its whole life, fixed when the item is opened, on every
+  event that refers to it;
+- a call the generation ends inside (issue #211: its JSON is not closed) keeps its own id and is never merged with,
+  or given the id of, a completed call. The Responses item ends `status: "incomplete"`, Chat Completions reports
+  `finish_reason: "length"`/`"stop"` rather than `"tool_calls"`, and Anthropic drops the block from the non-streamed
+  message;
+- a streamed answer and the non-streamed one describe the same calls with the same ids and names, and the final
+  arguments are the concatenation of the streamed pieces.
+
+Sending results back: each `function_call_output` / `tool` message / `tool_result` is matched to the call its id
+names and put back in the order the calls were made (a client that ran its calls in parallel reports them in the
+order they finished). A result whose id names no call of the assistant turn before it is a mistake in the request,
+and attaching it to some other call is what makes a session unrestorable, so the server answers `400` instead:
+`invalid_request_error` with the field in `param` (`messages[2].tool_call_id`, `messages[2].content.tool_use_id`,
+`input[2].call_id` - the item that names the unknown id). A client that sends ids for neither side is left alone, as
+there is nothing to pair on.
+
+Pinned by `serve/test_tool_call_ids.py` (no GPU or model download: the parser and the three event layers driven
+directly, plus the three APIs over HTTP): `python -m unittest serve.test_tool_call_ids` - 33 tests in 3.2 s on
+Windows with the mock engine.
+
+The same rules checked against a running server: `python tools/tool_call_ids_http_smoke.py --run` asks a real model
+for two, then three parallel reads (and two of them with byte-identical arguments), replays the turn with the results
+reported in the reverse of the call order, and sends one result naming a `call_id` no call issued. Dry run by
+default; `--url`/`--model` to point it elsewhere. Its own checks are tested offline - canned streams, each mutated in
+the way that would mis-pair a client's bookkeeping - by `python -m unittest tools.test_tool_call_ids_http_smoke`
+(30 tests in 0.12 s). Against `qwen3.8-flash-next-iq3_xxs` on Windows, 11 checks pass.
+
 ### The Responses API and Codex CLI
 
 `POST /v1/responses` (0.1.39, #451) speaks OpenAI's newer Responses API, which Codex CLI uses (it no longer

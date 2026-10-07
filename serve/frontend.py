@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -362,8 +363,12 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+def openai_to_messages(req: dict, ids: CallIds | None = None) -> tuple[list[dict], list[dict] | None, dict]:
+    """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  `ids`: the request's id
+    registry.  A `tool_call_id` the client sent is kept on the call it names and on the tool result that answers
+    it, so pair_tool_results can put each result back on its own call; the ids are then recorded in the registry
+    (and dropped from the messages, which the template never sees) so no id this conversation already used is
+    reissued by the parser."""
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
@@ -378,9 +383,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                call = {"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}}
+                if c.get("id"):
+                    call["_call_id"] = c["id"]
+                calls.append(call)
             out["tool_calls"] = calls
+        if role == "tool" and m.get("tool_call_id"):
+            out["_call_id"] = m["tool_call_id"]
+            out["_param"] = f"messages[{len(messages)}]"
         messages.append(out)
+    pair_tool_results(messages, ids, param="messages", field="tool_call_id")
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
@@ -425,10 +437,13 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True,
+                          ids: CallIds | None = None) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    renders it without thinking (#278, the config's "anthropic_thinking": "on_request").  `ids`: the request's id
+    registry, as on the OpenAI path - a `tool_use` block's id and the `tool_use_id` of the result that answers it
+    are kept so each result is put back on its own call, and recorded so they are not reissued."""
     messages = []
     system = req.get("system")
     if system:
@@ -453,11 +468,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                call = {"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}}
+                if block.get("id"):
+                    call["_call_id"] = block["id"]
+                calls.append(call)
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                result = {"role": "tool", "content": _parts_of(block.get("content"))}
+                if block.get("tool_use_id"):
+                    result["_call_id"] = block["tool_use_id"]
+                    result["_param"] = f"messages[{len(messages)}].content"
+                messages.append(result)
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -487,7 +509,115 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
+    pair_tool_results(messages, ids, param="messages", field="tool_use_id")
     return _late_system_to_user(messages), tools, kwargs
+
+
+# ------------------------------------------------------------------------------------------------ tool-call ids
+def new_call_id(prefix: str = "call", digits: int = 24) -> str:
+    """One tool-call / output-item id: opaque, ASCII, and nothing in it comes from the call's name, arguments,
+    position in the turn, or the clock.  The format is the one clients already see (`call_` + 24 hex digits,
+    `fc_`/`ctc_`/`msg_`/`rs_` + 32 for Responses items); only the guarantee over them changes (see CallIds)."""
+    return f"{prefix}_{uuid.uuid4().hex[:digits]}"
+
+
+class CallIds:
+    """Every id of one request, issued by one place.  A server that minted each id on its own could hand out an
+    id a previous turn of the same conversation had already used, and a client that keys its bookkeeping on
+    `call_id` (DeepSeek Harness joins an advertised call, the call it runs and the result it reports on
+    `${call_id}|${id}`) would then pair a late or replayed result with the wrong call.  So a request carries one
+    registry: it is seeded with every id the incoming conversation already names, and `new()` draws until it has
+    one it has not handed out before - within a response, and across the turns of a replayed conversation.
+
+    Nothing is encoded in an id: the tool name, the item type and the output index are not recoverable from it,
+    and two calls to the same tool with the same arguments get different ids because the id is a random draw,
+    not a hash of anything."""
+
+    def __init__(self, known: "Iterable[str] | None" = None):
+        self.used: set[str] = set()
+        self.note(known or ())
+
+    def note(self, value) -> None:
+        """Remember id(s) the client already used, so they are never reissued and never collide with a new one.
+        Takes one id or any iterable of ids; None and "" are ignored."""
+        if value is None:
+            return
+        if isinstance(value, str):
+            if value:
+                self.used.add(value)
+            return
+        for v in value:
+            if v:
+                self.used.add(str(v))
+
+    def new(self, prefix: str = "call", digits: int = 24) -> str:
+        """An id this request has not issued and the conversation did not already use.  The id is recorded here
+        before it is returned, so a second call for the same prefix cannot return the first one."""
+        while True:
+            value = new_call_id(prefix, digits)
+            if value not in self.used:
+                self.used.add(value)
+                return value
+
+
+class ToolCallPairingError(ValueError):
+    """A tool result whose `tool_call_id`/`call_id` names no call of the assistant turn it follows.  `.param` is
+    the request field to point at."""
+
+    def __init__(self, message: str, param: str):
+        super().__init__(message)
+        self.param = param
+
+
+def pair_tool_results(messages: list[dict], ids: "CallIds | None" = None,
+                      param: str = "messages", field: str = "tool_call_id", error=None) -> None:
+    """Put every tool result back on the call its id names, in the order the calls were made, and refuse the ones
+    that name nothing.
+
+    A client that ran its calls in parallel sends the results back in the order they finished, which is not the
+    order of the calls; a server that appends them as they arrive therefore shows the model the second call's
+    answer under the first call.  Each run of tool messages is sorted into the order of the assistant turn's
+    `tool_calls` (a result whose id matches no call of that turn keeps its place, at the end).
+
+    A result naming an id the turn never issued is a mistake in the request, and attaching it to some other call
+    is what makes a session unrestorable: it is reported instead (`error(...)` if given, else
+    ToolCallPairingError).  Only when the turn's calls carry ids - a client that sends ids for neither side is
+    left alone, since there is nothing to pair on."""
+    at = 0
+    while at < len(messages):
+        if messages[at].get("role") != "tool":
+            at += 1
+            continue
+        end = at
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        run = messages[at:end]
+        prev = messages[at - 1] if at else {}
+        order = [c.get("_call_id") for c in (prev.get("tool_calls") or []) if isinstance(c, dict)] \
+            if prev.get("role") == "assistant" else []
+        rank = {cid: k for k, cid in enumerate(order) if cid}
+        if rank:
+            for m in run:
+                cid = m.get("_call_id")
+                if cid and cid not in rank:
+                    raise (error or ToolCallPairingError)(
+                        f"a tool result for {field} {cid!r}, which no tool call of the assistant turn before it "
+                        f"issued", f"{m.get('_param') or f'{param}[{at}]'}.{field}")
+            run.sort(key=lambda m: rank.get(m.get("_call_id"), len(order)))
+            messages[at:end] = run
+        at = end
+    if ids is not None:
+        for m in messages:
+            ids.note(m.get("_call_id"))
+            for c in m.get("tool_calls") or []:
+                if isinstance(c, dict):
+                    ids.note(c.get("_call_id"))
+    for m in messages:
+        m.pop("_call_id", None)
+        m.pop("_param", None)
+        for c in m.get("tool_calls") or []:
+            if isinstance(c, dict):
+                c.pop("_call_id", None)
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -495,7 +625,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
 class ToolCall:
     name: str
     arguments: dict
-    id: str = field(default_factory=lambda: "call_" + uuid.uuid4().hex[:24])
+    id: str = field(default_factory=lambda: new_call_id())
 
 
 @dataclass
@@ -662,7 +792,7 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
-def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+def parse_tool_call(body: str, schema: dict | None = None, ids: CallIds | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
@@ -692,7 +822,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                 args[pname] = json.loads(value)
             except ValueError:
                 args[pname] = value
-    return ToolCall(name=name, arguments=args)
+    return ToolCall(name=name, arguments=args, id=(ids.new() if ids is not None else new_call_id()))
 
 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -703,11 +833,17 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False):
+                 recover: bool = False, ids: CallIds | None = None):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # Every id this turn issues comes from one registry (see CallIds): distinct inside the turn, distinct from
+        # every id the request's conversation already used, and never derived from a name, the arguments, the
+        # position of the call or the clock.  Without it two parallel calls to the same tool with the same
+        # arguments could be handed the same id, and a client that joins its own bookkeeping on `call_id` would
+        # pair one call's result with the other.
+        self.ids = ids or CallIds()
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -835,7 +971,7 @@ class OutputParser:
                 if b < 0:
                     return out
                 name = rest[a + 10:b]
-                self.scall = ToolCall(name=name, arguments={})
+                self.scall = ToolCall(name=name, arguments={}, id=self.ids.new())
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
                 out.append(Event("tool_start", call=self.scall))
@@ -946,7 +1082,7 @@ class OutputParser:
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0]
                         if name in self.schemas:
-                            call = parse_tool_call(body[:end], self.schemas.get(name))
+                            call = parse_tool_call(body[:end], self.schemas.get(name), self.ids)
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
@@ -1181,7 +1317,7 @@ class OutputParser:
         name = body.strip()[len(FUNC_START):].split(">", 1)[0]
         bare, self.bare = self.bare, False
         try:
-            call = parse_tool_call(body, self.schemas.get(name))
+            call = parse_tool_call(body, self.schemas.get(name), self.ids)
         except ValueError:
             if not self.recover:
                 raise

@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (CallIds, ChatTemplate, Event, OutputParser, ToolCallPairingError, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -3191,16 +3191,19 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, *, call_ids=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().  `call_ids` (a
+        serve.frontend.CallIds): the request's id registry, so every call_id this turn issues is distinct and one
+        the conversation has not used before; without it the parser keeps its own (still distinct within the turn)."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                              ids=call_ids)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3615,7 +3618,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, call_ids=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -3629,7 +3632,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, call_ids=call_ids):
             if kind == "done":
                 done = x
                 continue
@@ -3695,8 +3698,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         messages.append({"role": "assistant", "content": "".join(text).strip(),
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
-                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
-        messages += [{"role": "tool", "content": r} for r in results]
+                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}, "_call_id": c.id}
+                                        for c in calls]})
+        # Each result goes back on the call that produced it (zip), with that call's id, so the next round's
+        # prompt shows the model which answer belongs to which call.
+        messages += [{"role": "tool", "content": r, "_call_id": c.id} for c, r in zip(calls, results)]
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
@@ -3729,9 +3735,15 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None,
+                  call_ids=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run.
+    `call_ids`: the request's id registry (see Service.run).
+
+    A call's pieces all go to the `tool_calls[].index` its announcement created - `streamed` is keyed by the call's
+    own id, so a delta of one call can never land on another call's slot, and the id in the announcement is the id
+    in the finished message (openai_collect merges the same slots)."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
@@ -3746,7 +3758,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                                        call_ids=call_ids):
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
@@ -3768,7 +3781,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
+                at = streamed.get(ev.call.id)
+                if at is None:                 # a piece of a call that was never announced: nothing to attach it to
+                    continue
+                yield chunk({"tool_calls": [{"index": at, "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
@@ -3861,25 +3877,34 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, *, call_ids=None):
+    """Anthropic Messages streaming.  `call_ids`: the request's id registry (see Service.run).
+
+    `block_at` maps each call's id to the content block it was announced as, so an `input_json_delta` goes to that
+    block and not to whichever block was opened last - two parallel calls never share a block, and a block never
+    carries another call's input."""
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
         "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
     index, open_kind, used_tool = -1, None, False
+    block_at: dict[str, int] = {}                  # tool call id -> its content block index
 
     def close():
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, call_ids=call_ids):
         if kind == "ping":
             yield None
             continue
         if kind == "event":
             ev: Event = x
             if ev.kind == "tool_args":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                at = block_at.get(ev.call.id)
+                if at is None:                     # a piece of a call with no block of its own
+                    continue
+                yield "content_block_delta", {"type": "content_block_delta", "index": at,
                                               "delta": {"type": "input_json_delta", "partial_json": ev.text}}
                 continue
             if ev.kind == "tool_call" and ev.call.id in streamed:
@@ -3900,6 +3925,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                          "text": {"type": "text", "text": ""},
                          "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
                                       ev.call.name if ev.call else "", "input": {}}}[want]
+                if ev.call is not None:
+                    block_at[ev.call.id] = index
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
@@ -3932,7 +3959,10 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
 
 
 def anthropic_collect(events) -> dict:
-    msg, blocks = None, []
+    """The non-streamed Anthropic message, from the same events the streaming path sent.  Blocks are keyed by their
+    event index, so a delta is applied to the block its event names - the aggregation cannot put one call's input
+    pieces into another call's block, and the block keeps the id it was opened with."""
+    msg, blocks = None, {}
     for item in events:
         if item is None:                           # a heartbeat
             continue
@@ -3940,26 +3970,29 @@ def anthropic_collect(events) -> dict:
         if name == "message_start":
             msg = e["message"]
         elif name == "content_block_start":
-            blocks.append(dict(e["content_block"]))
+            blocks[e["index"]] = dict(e["content_block"])
         elif name == "content_block_delta":
-            d, b = e["delta"], blocks[-1]
+            d, b = e["delta"], blocks.get(e["index"])
+            if b is None:
+                continue
             if d["type"] == "text_delta":
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
-        elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
-            b = blocks[-1]
-            try:
-                b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
-                blocks.pop()
+        elif name == "content_block_stop":
+            b = blocks.get(e["index"])
+            if b is not None and "_json" in b:
+                try:
+                    b["input"] = json.loads(b.pop("_json") or "{}")
+                except ValueError:                 # a call the output ended inside (#211): it has no input to give
+                    blocks.pop(e["index"])
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
-    msg["content"] = blocks
+    msg["content"] = [blocks[i] for i in sorted(blocks)]
     return msg
 
 
@@ -4689,7 +4722,8 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            call_ids = CallIds()                    # every id of this request, minted in one place (serve.frontend)
+            messages, tools, kw = openai_to_messages(req, ids=call_ids)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
@@ -4717,8 +4751,9 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                               {t["name"] for t in extra}, call_ids) if use_mcp else None
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force,
+                                   call_ids=call_ids)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -4790,7 +4825,7 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, call_ids=asm.ids):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -4855,7 +4890,8 @@ def make_handler(svc: Service):
 
         def _responses_prepare(self, req):
             responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
+            call_ids = CallIds()                             # one registry for the whole request: the ids the client
+            messages = responses_api.input_messages(req, call_ids)   # sent and the ones this turn will mint
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, svc.shared)
             try:
@@ -4903,7 +4939,8 @@ def make_handler(svc: Service):
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
-                                          "reasoning.encrypted_content" in include, validator is not None)
+                                          "reasoning.encrypted_content" in include, validator is not None,
+                                          ids=call_ids)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 
@@ -4918,7 +4955,8 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            call_ids = CallIds()                             # one registry for this request (see _openai)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, call_ids)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
@@ -4930,7 +4968,8 @@ def make_handler(svc: Service):
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                      call_ids=call_ids)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))

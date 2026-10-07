@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import CallIds, Event, _late_system_to_user, _parts_of, effort_kwargs, pair_tool_results
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -51,6 +51,12 @@ def error_body(message, kind="invalid_request_error", param=None, code=None) -> 
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _item_id(ids: CallIds | None, prefix: str) -> str:
+    """An output item's id.  With the request's registry it is drawn there, so it cannot equal another item's id of
+    this response or an id a previous turn of the conversation already used; without one it is the old draw."""
+    return ids.new(prefix, 32) if ids is not None else new_id(prefix)
 
 
 # ------------------------------------------------------------------------------------------------ request -> chat
@@ -125,8 +131,11 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
-def input_messages(req: dict) -> list[dict]:
-    """`instructions` + `input` -> the chat template's messages."""
+def input_messages(req: dict, ids: CallIds | None = None) -> list[dict]:
+    """`instructions` + `input` -> the chat template's messages.  `ids`: the request's id registry.  Every `call_id`
+    the client sent is recorded in it (so a new turn of this conversation cannot reissue one) and kept on the call
+    and its output so each output is put back on the call its id names - an output naming a `call_id` no call of
+    that turn issued is a 400, not something attached to whichever call was nearest."""
     messages = []
     instructions = req.get("instructions")
     if instructions not in (None, ""):
@@ -188,7 +197,8 @@ def input_messages(req: dict) -> list[dict]:
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
                                                         "_call_id": item.get("call_id")})
         elif kind in ("function_call_output", "custom_tool_call_output"):
-            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id"),
+                             "_param": param})
             open_turn = None
             thinking.clear()
         elif kind == "additional_tools":
@@ -199,7 +209,7 @@ def input_messages(req: dict) -> list[dict]:
         else:
             raise ResponsesError(f"input items of type {kind!r} are not supported", param + ".type",
                                  "unsupported_parameter")
-    _order_tool_results(messages)
+    pair_tool_results(messages, ids, param="input", field="call_id", error=ResponsesError)
     # leading system/developer messages (Codex: instructions, then its developer message) become one system message
     # at the start; later ones become user messages in place, as on the chat path
     lead = 0
@@ -208,29 +218,6 @@ def input_messages(req: dict) -> list[dict]:
     if lead > 1:
         messages[:lead] = [{"role": "system", "content": "\n\n".join(m["content"] for m in messages[:lead])}]
     return _late_system_to_user(messages)
-
-
-def _order_tool_results(messages):
-    """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
-    i = 0
-    while i < len(messages):
-        if messages[i]["role"] != "tool":
-            i += 1
-            continue
-        j = i
-        while j < len(messages) and messages[j]["role"] == "tool":
-            j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
-        i = j
-    for m in messages:
-        m.pop("_call_id", None)
-        for c in m.get("tool_calls") or []:
-            c.pop("_call_id", None)
 
 
 def request_tools(req: dict):
@@ -470,11 +457,19 @@ class Assembler:
     answer is the `response` of the last event, so both modes are the same items."""
 
     def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool,
-                 json_mode: bool = False):
+                 json_mode: bool = False, ids: CallIds | None = None):
         self.names, self.encrypted, self.json_mode = names, encrypted, json_mode
         self.prompt_tokens = prompt_tokens
         self.seq = 0
+        self.ids = ids or CallIds()
         self.item = None                             # the open output item
+        # Every id of this response is drawn from `self.ids`, and each call is bound to the item it was announced
+        # with: `items` maps a call_id to that item and `at` fixes the item's output_index when it is opened.
+        # Arguments are then routed by call_id, and an item's index never moves while the response grows - a client
+        # that keys its per-item state on `output_index` (and on `${call_id}|${id}`) sees one item per call, from
+        # its first event to the copy inside response.completed.
+        self.items: dict[str, dict] = {}             # call_id -> the item announced for that call
+        self.at: dict[str, int] = {}                 # item id -> its output_index, fixed at open
         self.json_text = []                          # structured output: the answer, held until it is checked
         self.called = False                          # a tool call was made: this turn is not the final answer
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
@@ -510,6 +505,7 @@ class Assembler:
 
     def _open(self, item) -> list[dict]:
         self.response["output"].append(item)
+        self.at[item["id"]] = len(self.response["output"]) - 1
         self.item = item
         out = [self.event("response.output_item.added", output_index=self.index, item=copy.deepcopy(item))]
         if item["type"] == "message":
@@ -523,11 +519,15 @@ class Assembler:
     def index(self) -> int:
         return len(self.response["output"]) - 1
 
-    def close(self, status="completed") -> list[dict]:
-        item, self.item = self.item, None
+    def close(self, status="completed", item=None) -> list[dict]:
+        """Close one output item (the open one, by default): its done events carry the item id and the output_index
+        it was opened at, never a later position."""
+        item = item if item is not None else self.item
         if item is None:
             return []
-        at, out = self.response["output"].index(item), []
+        if item is self.item:
+            self.item = None
+        at, out = self.at[item["id"]], []
         item["status"] = status
         if item["type"] == "message":
             part = item["content"][0]
@@ -559,8 +559,8 @@ class Assembler:
                 return out
             if self.item is None or self.item["type"] != "reasoning":
                 out += self.close()
-                out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
-                                   "content": [{"type": "reasoning_text", "text": ""}]})
+                out += self._open({"id": _item_id(self.ids, "rs"), "type": "reasoning", "status": "in_progress",
+                                   "summary": [], "content": [{"type": "reasoning_text", "text": ""}]})
             self.item["content"][0]["text"] += ev.text
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
                                   content_index=0, delta=ev.text))
@@ -573,7 +573,7 @@ class Assembler:
                 return out
             if self.item is None or self.item["type"] != "message":
                 out += self.close()
-                out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
+                out += self._open({"id": _item_id(self.ids, "msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
             self.item["content"][0]["text"] += ev.text
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
@@ -583,16 +583,19 @@ class Assembler:
             out += self._call_started()
             out += self._open(self._call_item(ev))
         elif kind == "tool_args":
-            item = self.item
-            if item is None or item.get("call_id") != ev.call.id:
+            # The delta goes to the item announced for THIS call, not to whichever item is open: with parallel
+            # calls the parser can finish one while another is still being written, and a delta sent to the wrong
+            # item is a call carrying another call's arguments.
+            item = self.items.get(ev.call.id) if ev.call is not None else None
+            if item is None:
                 return out
             if item["type"] == "function_call":         # a custom tool's input is sent whole, at its end
                 item["arguments"] += ev.text
                 out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
-                                      output_index=self.index, delta=ev.text))
+                                      output_index=self.at[item["id"]], delta=ev.text))
         elif kind == "tool_call":
-            item = self.item
-            if item is None or item.get("call_id") != ev.call.id:     # a call that was not announced while written
+            item = self.items.get(ev.call.id)
+            if item is None:                            # a call that was not announced while written
                 out += self.close()
                 out += self._call_started()
                 out += self._open(self._call_item(ev))
@@ -600,21 +603,24 @@ class Assembler:
                 if item["type"] == "function_call":
                     item["arguments"] = json.dumps(ev.call.arguments, ensure_ascii=False)
                     out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
-                                          output_index=self.index, delta=item["arguments"]))
+                                          output_index=self.at[item["id"]], delta=item["arguments"]))
+            at = self.at[item["id"]]
             if item["type"] == "custom_tool_call":
                 value = ev.call.arguments.get("input") if isinstance(ev.call.arguments, dict) else None
                 item["input"] = value if isinstance(value, str) else json.dumps(ev.call.arguments, ensure_ascii=False)
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
-                                      output_index=self.index, delta=item["input"]))
-            out += self.close()
+                                      output_index=at, delta=item["input"]))
+            if item is not self.item:
+                out += self.close()              # close whatever else is open before this call's item
+            out += self.close(item=item)
         return out
 
     def _release(self, text: str) -> list[dict]:
         """A held structured answer (or the words written beside a tool call) as one message item."""
         if not text.strip():
             return []
-        out = self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
-                          "content": []})
+        out = self._open({"id": _item_id(self.ids, "msg"), "type": "message", "status": "in_progress",
+                          "role": "assistant", "content": []})
         self.item["content"][0]["text"] = text
         out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
                               content_index=0, delta=text, logprobs=[]))
@@ -632,15 +638,20 @@ class Assembler:
         return out
 
     def _call_item(self, ev: Event) -> dict:
+        """The output item for one call: its own id (drawn from the request's registry, so no other call of this
+        response and no earlier turn of the conversation has it) and the call_id the parser issued for it.  The
+        pair is registered here, at the moment the call is announced, which is where "the id a call was announced
+        with" and "the item its deltas belong to" become the same thing."""
         namespace, name, kind = self.names.get(ev.call.name, (None, ev.call.name, "function"))
         if kind == "custom":
-            item = {"id": new_id("ctc"), "type": "custom_tool_call", "status": "in_progress", "call_id": ev.call.id,
-                    "name": name, "input": ""}
+            item = {"id": _item_id(self.ids, "ctc"), "type": "custom_tool_call", "status": "in_progress",
+                    "call_id": ev.call.id, "name": name, "input": ""}
         else:
-            item = {"id": new_id("fc"), "type": "function_call", "status": "in_progress", "call_id": ev.call.id,
-                    "name": name, "arguments": ""}
+            item = {"id": _item_id(self.ids, "fc"), "type": "function_call", "status": "in_progress",
+                    "call_id": ev.call.id, "name": name, "arguments": ""}
         if namespace:
             item["namespace"] = namespace
+        self.items[ev.call.id] = item
         return item
 
     def finish(self, done: dict, validate=None) -> list[dict]:
