@@ -492,6 +492,67 @@ class SmallCardTip(unittest.TestCase):
         self.assertIn("close other programs", tip)
 
 
+class SplitCardOrder(unittest.TestCase):
+    """The card that drives the monitors is FIRST in a two-card split, so the last card - the one that runs the last
+    layers, the output head and the draft layer, where every decode window ends - is the one nothing else is using.
+
+    Measured on a pair of RTX 5070 Ti, Windows 11 under WDDM, engine 0.1.40, the same pack and the same
+    `--layer-split auto` (three runs of fixed 1,400-token requests through the server, 2026-10-07):
+      desktop card LAST:  util 22-25% / 74-78% (evenness 0.28-0.33), idle card's SM clock 1.69-2.18 GHz against
+                          2.85-2.90 GHz, decode 52.3-61.3 tok/s over ten requests (mean 56.7); a second run of five
+                          requests was 14.1-109.6 (mean 77.8) at 25-33% / 64-72% and 2.26-2.68 GHz
+      desktop card FIRST: util 54-60% / 40-43% (evenness 0.71-0.79), both cards 2.80-2.96 GHz,
+                          decode 126.6-145.0 tok/s over seven requests
+    Not a cache effect: the slower ordering had the better caches (92.3-92.9% of decode lookups hit, 89.3-91.2%)."""
+
+    SAME = [{"index": 0, "name": "RTX 5070 Ti", "vram_gb": 16.0, "arch": "120", "driver": "581.08", "display": False},
+            {"index": 1, "name": "RTX 5070 Ti", "vram_gb": 16.0, "arch": "120", "driver": "581.08", "display": True}]
+
+    def test_gpus_reads_display_active(self):
+        csv = ("0, NVIDIA GeForce RTX 5070 Ti, 16384, 12.0, 581.08, Disabled\n"
+               "1, NVIDIA GeForce RTX 5070 Ti, 16384, 12.0, 581.08, Enabled\n")
+        with mock.patch.object(setup, "out", lambda cmd: csv):
+            got = setup.gpus()
+        self.assertEqual([g["display"] for g in got], [False, True])
+        self.assertEqual(got[0]["arch"], "120")                      # the other columns still parse
+        with mock.patch.object(setup, "out", lambda cmd: "0, RTX 4060, 8192, 8.6, 560.00\n"):
+            self.assertIsNone(setup.gpus()[0]["display"])            # an old nvidia-smi: unknown, not False
+
+    def test_gpu_drives_display_uses_the_card_it_listed(self):
+        # one nvidia-smi read for the whole list (gpus), so the #779 check does not ask a second time per card
+        with mock.patch.object(setup, "out") as o:
+            self.assertTrue(setup.gpu_drives_display(dict(self.SAME[1])))
+            self.assertFalse(setup.gpu_drives_display(dict(self.SAME[0])))
+            o.assert_not_called()
+        with mock.patch.object(setup, "out") as o:
+            o.return_value = "Enabled\n"
+            self.assertTrue(setup.gpu_drives_display({"index": 4}))   # named some other way: asked on its own
+            self.assertIn("4", o.call_args[0][0])
+
+    def test_the_monitor_card_of_an_identical_pair_goes_first(self):
+        self.assertEqual([g["index"] for g in setup.together_ok(self.SAME)], [1, 0])
+
+    def test_a_real_difference_still_beats_the_display(self):
+        newer = {**self.SAME[0], "index": 2, "arch": "120", "vram_gb": 16.0, "display": False}
+        older = {**self.SAME[1], "index": 3, "arch": "86", "vram_gb": 24.0, "display": True}
+        self.assertEqual([g["index"] for g in setup.together_ok([older, newer])], [2, 3])   # generation first
+        big = {**self.SAME[0], "index": 4, "vram_gb": 24.0, "display": False}
+        small = {**self.SAME[1], "index": 5, "vram_gb": 16.0, "display": True}
+        self.assertEqual([g["index"] for g in setup.together_ok([small, big])], [4, 5])     # VRAM second
+
+    def test_a_card_that_drives_nothing_is_not_moved(self):
+        self.assertEqual([g["index"] for g in setup.together_ok([dict(x, display=False) for x in self.SAME])], [0, 1])
+        self.assertEqual([g["index"] for g in setup.together_ok([dict(x, display=None) for x in self.SAME])], [0, 1])
+
+    def test_the_recommended_pair_of_the_ask_is_the_same_order(self):
+        # choose_gpus offers can[:2]; the order it offers is the order it writes to the config
+        with mock.patch.object(setup, "gpus", lambda: list(self.SAME)), \
+             mock.patch.object(setup, "ask", lambda *a, **k: "1"), \
+             mock.patch.object(setup, "ram_gb", lambda: 64.0):
+            a = mock.Mock(gpus=None, gpu=None, yes=True, check=True)
+            self.assertEqual(setup.choose_gpus(a, setup.gpus()), [1, 0])
+
+
 class DesktopReserveTip(unittest.TestCase):
     """#560 #516: an AMD card on a Linux desktop gets a recommended reserve (3072 MiB) - a tip, the config is not
     changed."""

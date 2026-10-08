@@ -727,23 +727,41 @@ def _cpuid_avx2() -> bool:
 
 
 def gpus():
-    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
-             "--format=csv,noheader,nounits"])
+    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use).
+    "display": True when the card drives a monitor (nvidia-smi's display_active), None when it did not say."""
+    cols = "index,name,memory.total,compute_cap,driver_version,display_active"
+    s = out(["nvidia-smi", f"--query-gpu={cols}", "--format=csv,noheader,nounits"])
+    found = _parse_gpus(s)
+    if not found:
+        # An nvidia-smi without display_active: query the columns that have always been there, so a card list is
+        # still read (the display tie-break in gpu_rank is then simply not applied).
+        found = _parse_gpus(out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+                                 "--format=csv,noheader,nounits"]))
+    return found
+
+
+def _parse_gpus(s: str) -> list:
     found = []
     for line in s.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            idx, name, mem, cc, drv = parts[:5]
+            g = {"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
+                 "driver": drv}
         except ValueError:
             continue
+        g["display"] = parts[5].lower() == "enabled" if len(parts) > 5 else None
+        found.append(g)
     return found
 
 
 def gpu_drives_display(g) -> bool:
     """#779: True when nvidia-smi says this card has a display attached (display_active Enabled): its desktop needs
-    VRAM too, and a full expert cache beside it has crashed laptops."""
+    VRAM too, and a full expert cache beside it has crashed laptops.  gpus() reads display_active for every card it
+    lists, so such a card answers from that read and nvidia-smi is asked once; a card named some other way is asked
+    on its own."""
+    if g.get("display") is not None:
+        return g["display"]
     text = out(["nvidia-smi", "-i", str(g.get("index", 0)), "--query-gpu=display_active", "--format=csv,noheader"])
     return text.strip().lower() == "enabled"
 
@@ -881,9 +899,21 @@ def gpu_problem(g, together=False):
 
 
 def gpu_rank(g):
-    """The order cards share a model in: the newest generation first (it gets the first layers and most of the
-    work), then the most VRAM."""
-    return (-int(g["arch"]), -round(g["vram_gb"]), g["index"])
+    """The order cards share a model in: the newest generation first, then the most VRAM, and - when two cards are
+    otherwise the same, which is a pair of identical cards - the one that drives the monitors FIRST.
+
+    WHY THE MONITOR CARD IS NOT LAST.  A split's last card runs the last layers, the output head and the draft
+    layer, and every decode window ends there (docs/MULTI_GPU.md).  On a pair of RTX 5070 Ti, Windows 11 under
+    WDDM, engine 0.1.40, the same pack and the same `--layer-split auto` (three runs of fixed 1,400-token requests
+    through the server, 2026-10-07): with the desktop card last it ran 74-78% of the window while the other card ran
+    22-25% (evenness 0.28-0.33), the idle card's SM clock sat at 1.69-2.18 GHz against 2.85-2.90 GHz, and decode was
+    52.3-61.3 tok/s over ten requests (mean 56.7).  A second run of the same ordering, five requests, was
+    14.1-109.6 (mean 77.8) at 25-33% / 64-72% and 2.26-2.68 GHz.  With the desktop card first, 54-60% against
+    40-43% (evenness 0.71-0.79), both cards at 2.80-2.96 GHz, and decode was 126.6-145.0 tok/s over seven of the
+    same requests.  Not a cache effect - the slower ordering had the better caches (92.3-92.9% of decode lookups
+    hit, against 89.3-91.2%).  `auto` searches only where the boundary K sits and prices cards by SMs x
+    `cudaDevAttrClockRate`, so it cannot see the desktop; the order is this list's."""
+    return (-int(g["arch"]), -round(g["vram_gb"]), 0 if g.get("display") else 1, g["index"])
 
 
 def gpu_name(g) -> str:

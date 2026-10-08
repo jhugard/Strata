@@ -191,6 +191,59 @@ The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 
 **Which cards and in what order:**
 - Put the fastest card first; auto gives it as many layers as its cache allows.
+- **When two cards are otherwise the same, put the one that drives the monitors FIRST.** A split's last card runs
+  its last layers, the output head and the draft layer, and every decode window ends there; the first card is idle
+  for the rest of one window (`--pipeline-windows 2`, below, keeps it busy on the *next* window - these runs used the
+  default single window). On a pair of RTX 5070 Ti (Windows 11 under WDDM, engine 0.1.40, the same pack,
+  `--layer-split auto`), fixed 1,400-token requests through the server while both cards are sampled at 5 Hz:
+
+  | `gpu` | which card is last | requests | util idle / desktop card | evenness | SM clocks idle / desktop | decode tok/s |
+  |---|---|---|---|---|---|---|
+  | `[0, 1]` | the desktop card | 10 | 22-25% / 74-78% | 0.28-0.33 | 1.69-2.18 / 2.85-2.90 GHz | 52.3-61.3 (mean 56.7) |
+  | `[0, 1]` | the desktop card | 5 | 25-33% / 64-72% | 0.35-0.50 | 2.26-2.68 / 2.84-2.89 GHz | 14.1-109.6 (mean 77.8) |
+  | `[1, 0]` | the idle card | 7 | 54-60% / 40-43% | 0.71-0.79 | 2.80-2.96 / 2.83-2.89 GHz | 126.6-145.0 |
+
+  The same requests, the same driver, the same harness, three runs on 2026-10-07. The idle card's SM clock is what
+  moves: with the desktop card last, one card does three quarters of every window, the other sits at a quarter of
+  the util and its clock drops to 1.7-2.3 GHz; with it first the two cards split the window and both hold ~2.9 GHz.
+  It is not a cache effect - the slower ordering had the *better* caches (92.3-92.9% of decode lookups hit, against
+  89.3-91.2%). It is not the parked clock either: a keep-warm CUDA kernel that held the idle card at P1 / 2985 MHz SM
+  / 40% util for every sample of a run moved decode only 36.7 -> 38.3 tok/s (and back to 36.9 when the kernel
+  stopped), while moving the last stage to that card moved decode 2.4x (mean 56.7 -> 136.9 tok/s). The clock is a
+  symptom of where the work sits, not the thing to fix. `--layer-split auto` cannot
+  find this on its own - it searches only where the boundary K sits, and prices a card by SMs x
+  `cudaDevAttrClockRate` (a static maximum, identical on an identical pair), so the desktop's share of a card never
+  enters it. The order is the config's `gpu` list, and setup now puts the monitor card first for an otherwise-tied
+  pair.
+- **The decay a split can cause is progressive, and it is not the context.** Every request of 150 output tokens or
+  more in the same PC's server log (1,436 requests, 2026-10-07), grouped by boot. The ordering comes from the split
+  line the engine prints - `layer split auto: CUDA0 70 SMs at 2.57 GHz` is `[0, 1]`, `at 2.50 GHz` is `[1, 0]`. `r`
+  is the correlation of the per-request decode rate against the request's position in its boot, and against its
+  prompt size:
+
+  | boot | `gpu` | engine | requests | r vs position | r vs prompt size | first 5 requests | last 5 | boot mean |
+  |---|---|---|---|---|---|---|---|---|
+  | 75 | `[0, 1]` | 0.1.39 | 21 | -0.76 | -0.06 | 74 88 80 85 81 | 40 44 40 53 58 | 58.6 |
+  | 198 | `[0, 1]` | 0.1.39 | 191 | -0.76 | +0.29 | 75 89 86 92 90 | 32 31 29 30 32 | 71.9 |
+  | 896 | `[0, 1]` | 0.1.39 | 176 | -0.81 | +0.05 | 61 63 54 61 56 | 25 25 22 24 25 | 46.1 |
+  | 1524 | `[0, 1]` | 0.1.39 | 63 | -0.33 | -0.26 | 72 56 59 57 66 | 56 56 43 47 46 | 60.5 |
+  | 1971 | `[0, 1]` | 0.1.39 | 14 | -0.79 | -0.80 | 74 69 34 24 24 | 24 24 24 24 22 | 31.2 |
+  | 3467 | `[0, 1]` | 0.1.40 | 59 | -0.28 | -0.27 | 67 83 74 77 68 | 68 80 69 71 68 | 75.2 |
+  | 3978 | `[0, 1]` | 0.1.40 | 360 | -0.34 | +0.18 | 68 69 66 68 68 | 46 42 47 37 38 | 49.1 |
+  | 5237 | `[0, 1]` | 0.1.40 | 65 | +0.16 | -0.59 | 44 42 42 46 48 | 46 44 57 54 56 | 52.2 |
+  | 5596 | `[0, 1]` | 0.1.40 | 165 | -0.13 | -0.56 | 84 85 80 85 92 | 72 72 67 73 74 | 71.6 |
+  | 2130 | `[1, 0]` | 0.1.39 | 200 | -0.18 | -0.25 | 94 104 106 101 96 | 97 88 107 78 116 | 99.8 |
+  | 2976 | `[1, 0]` | 0.1.40 | 111 | -0.16 | -0.23 | 101 107 110 106 116 | 108 82 96 106 102 | 100.3 |
+  | 5498 | `[1, 0]` | 0.1.40 | 11 | +0.87 | -0.89 | 113 111 107 112 138 | 137 133 150 150 149 | 131.6 |
+
+  Eight of the nine `[0, 1]` boots lose rate as the session goes on (mean r = -0.45). On the four with the strongest
+  correlation, a boot's first five requests run 61-92 tok/s and its last five 22-58. The three `[1, 0]` boots do not
+  decay: the two long ones have r = -0.18 and -0.16 and still run 78-116 tok/s over their last five requests, and the
+  short one rose from 113 to 150. Prompt size explains none of the decay - its `r` is both signs and never larger in
+  magnitude than the position one on the `[0, 1]` boots that decay. The client's own compactions did not recover it
+  either: on the 65 prompt drops of 20% or more in the `[0, 1]` boots, the mean rate over the five requests before
+  each drop was 58.4 tok/s and over the five after it 57.5 (36 drops left the rate within 5 tok/s, 16 lost more, 13
+  gained more). Shrinking the context cannot recover a decode that the last card is losing to the desktop.
 - Leave out a much slower card when two already hold the model. An RTX 2080 Ti as a third card made the 5080 +
   3090 pair slower (68 / 90 tok/s decode): every extra card costs its own round per window.
 - More cards pay off when the model's routed experts do not fit the faster ones.
