@@ -21,6 +21,7 @@ test('bounded reader gets real metadata and rejects fake extensions, partial ten
  ggufFixture(file,{version:1});assert.throws(()=>readGGUF(file),/version/);
  ggufFixture(file,{extra:[['general.name',8,'duplicate']]});assert.throws(()=>readGGUF(file),/duplicate/);
  ggufFixture(file,{arch:'clip'});assert.throws(()=>inspectLocalModel(file),/architecture.*not supported/);
+ ggufFixture(file,{arch:'qwen4exp'});let qwen4expError=null;try{inspectLocalModel(file)}catch(error){qwen4expError=error.message}assert.ok(!/not supported by this importer/.test(qwen4expError||''),'qwen4exp GGUFs must import like the other supported architectures');
  ggufFixture(file,{tensorCount:0});assert.throws(()=>inspectLocalModel(file),/missing tensors/);
  ggufFixture(file,{context:1024});assert.throws(()=>inspectLocalModel(file),/context_length/);
  const oversized=Buffer.alloc(24);oversized.write('GGUF');oversized.writeUInt32LE(3,4);oversized.writeBigUInt64LE(2n**63n,8);writeFileSync(file,oversized);assert.throws(()=>readGGUF(file),/unsupported integer/);
