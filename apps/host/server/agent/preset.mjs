@@ -98,9 +98,15 @@ export function standardPreset({ platform = process.platform, search = false, of
     {
       id: 'delegation', name: 'cordis:group', group: true, isolate: { workflowEngine: true },
       config: [
+        // Since upstream 4df09d37d5 ("register shared control tools together") the control package's main entry
+        // registers `list_agents`, `send_message` and `interrupt_agent` itself. The old separate
+        // `dsh-tool-subagent-control/list-agents` row is gone from the package (no such subpath export), and naming
+        // it makes every new chat fail with `agent-preset/invalid: … list-agents … never started`.
         { id: 'tool-subagent-control', name: '@deepseek-ai/dsh-tool-subagent-control' },
-        { id: 'tool-subagent-list-agents', name: '@deepseek-ai/dsh-tool-subagent-control/list-agents' },
-        { id: 'tool-subagent', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: true } },
+        // `modelSelection` lets a helper start on a model of the person's choosing (the routes the profile's
+        // `subagent-model-selection-settings` row authorises); `modelDiscovery` registers `list_subagent_models`,
+        // which the `strata-models` plugin then rewords. Both keys are what the pinned preset uses.
+        { id: 'tool-subagent', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'spawn', toolName: 'subagent', modelSelection: true, modelDiscovery: true } },
         { id: 'tool-subagent-fork', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'fork', toolName: 'subagent_fork' } },
         { id: 'workflow-ptc', name: '@deepseek-ai/dsh-workflow-ptc', config: { provider: 'spawn' } },
         { id: 'tool-workflow', name: '@deepseek-ai/dsh-tool-workflow' },

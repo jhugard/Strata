@@ -80,6 +80,17 @@ export function apply(ctx, config = {}) {
       } catch { /* a tool that is not there yet is wrapped at the next change */ }
     }
   };
+  // A chat's tools are registered while its agent is being created, and the Harness has no agent until a
+  // session exists (the registry lists nothing before the first chat), so the wrap happens at the creation
+  // announcement as well as on any later tool change.
+  ctx.on('agent/created', ({ agent }) => {
+    try {
+      const sub = ctx.tools.get('subagent', agent);
+      if (sub) wrapSubagent(sub);
+      const list = ctx.tools.get('list_subagent_models', agent);
+      if (list) wrapList(list);
+    } catch { /* a tool that is not there yet is wrapped at the next change */ }
+  });
   ctx.on('tools/change', wrapAll);
   wrapAll();
 }
