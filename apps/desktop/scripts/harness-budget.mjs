@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 export const HARNESS_BUDGET_PATCH = Object.freeze({
   id: 'strata-pi-ai-context-safety-v2',
   package: '@earendil-works/pi-ai',
-  version: '1.1.0',
+  versions: ['1.1.0', '1.3.0'],
   file: 'node_modules/@earendil-works/pi-ai/dist/api/simple-options.js',
   beforeSha256: '9b3cc0ae6daa86fdc050bc0cb0f3f986401e64ccddbde6757183c9f8ad411be2',
 });
@@ -40,8 +40,9 @@ export function patchStagedHarnessBudget(stagedRoot) {
   } catch (error) {
     fail(`cannot read a standalone staged pi-ai dependency (${error.message})`);
   }
-  if (manifest?.name !== HARNESS_BUDGET_PATCH.package || manifest?.version !== HARNESS_BUDGET_PATCH.version)
-    fail('expected @earendil-works/pi-ai 1.1.0; review the patch before staging a different dependency');
+  if (manifest?.name !== HARNESS_BUDGET_PATCH.package
+    || !HARNESS_BUDGET_PATCH.versions.includes(manifest?.version))
+    fail(`expected ${HARNESS_BUDGET_PATCH.package} ${HARNESS_BUDGET_PATCH.versions.join(' or ')}; review the patch before staging a different dependency`);
   if (sha256(before) !== HARNESS_BUDGET_PATCH.beforeSha256)
     fail('unexpected simple-options.js SHA-256; review the dependency source before staging');
   const source = before.toString('utf8');

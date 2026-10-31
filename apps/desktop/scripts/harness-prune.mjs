@@ -37,6 +37,7 @@ export function isOtherOsBinaryFolder(platform, name, path) {
 const KNOWN_ABSENT = new Set([
   '@deepseek-ai/libreoffice-kit', '@deepseek-ai/dsh-client-ui-dockkit', '@deepseek-ai/dsh-client-web',
   '@deepseek-ai/dsh-experimental-webworker-runtime', '@deepseek-ai/dsh-remote-mock', '@deepseek-ai/dsh-client-test-runtime',
+  '@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-util-file-drag',
 ]);
 
 function jsFiles(dir, out = []) {

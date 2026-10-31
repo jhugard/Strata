@@ -73,7 +73,7 @@ test('unknown and nonpositive context paths retain their previous behavior', t =
 test('patch provenance records its identity, exact dependency and before/after hashes', t => {
   const { file, packageFile, provenance } = patched(t);
   assert.equal(sha256(original), HARNESS_BUDGET_PATCH.beforeSha256);
-  assert.deepEqual(provenance, { id: 'strata-pi-ai-context-safety-v2', package: '@earendil-works/pi-ai', version: '1.1.0',
+  assert.deepEqual(provenance, { id: 'strata-pi-ai-context-safety-v2', package: '@earendil-works/pi-ai', versions: HARNESS_BUDGET_PATCH.versions,
     file: HARNESS_BUDGET_PATCH.file, beforeSha256: sha256(original), afterSha256: sha256(readFileSync(file)) });
   assert.notEqual(provenance.beforeSha256, provenance.afterSha256);
   assert.deepEqual(JSON.parse(readFileSync(packageFile, 'utf8')), { name: '@earendil-works/pi-ai', version: '1.1.0' });
