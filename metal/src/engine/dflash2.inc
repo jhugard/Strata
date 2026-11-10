@@ -138,6 +138,13 @@ bool df2_read_index(const std::string& path, std::vector<int>& taps, std::map<st
     std::string index(hdr[2], ' ');
     if (std::fread(index.data(), 1, hdr[2], f) != hdr[2]) { err = "dflash2: the pack's index is cut short"; return false; }
     data_off = 12 + hdr[2];
+    // The bytes that follow the index are all any tensor may use, so no tensor may reach past them.
+    uint64_t file_bytes = 0;
+    if (!strata::df2::file_size(f, &file_bytes) || file_bytes < data_off) {
+        err = "dflash2: " + path + " is shorter than its header";
+        return false;
+    }
+    strata::df2::IndexGuard guard(file_bytes - data_off);
     total = 0;
     for (size_t i = 0; i < index.size();) {
         const size_t j = index.find('\n', i);
@@ -153,6 +160,10 @@ bool df2_read_index(const std::string& path, std::vector<int>& taps, std::map<st
                 for (const char* q = c; *q;) { taps.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
             }
         } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            strata::df2::TensorDecl d;
+            d.name = a; d.dtype = b; d.rows = v1; d.cols = v2; d.off = v3; d.bytes = v4;
+            uint64_t end = 0;
+            if (!guard.accept(d, &end, &err)) return false;
             gguf::Tensor t;
             t.name = a;
             const std::string dt = b;
@@ -161,7 +172,7 @@ bool df2_read_index(const std::string& path, std::vector<int>& taps, std::map<st
             t.offset = (uint64_t) v3;
             t.bytes = (uint64_t) v4;
             ten[t.name] = t;
-            total = std::max(total, t.offset + t.bytes);
+            total = std::max(total, end);
         }
     }
     if (ten.empty()) { err = "dflash2: the pack has no tensors"; return false; }

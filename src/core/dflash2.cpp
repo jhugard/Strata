@@ -1,5 +1,6 @@
 // src/core/dflash2.cpp - see include/strata/core/dflash2.hpp.
 #include "strata/core/dflash2.hpp"
+#include "strata/core/df2_pack_guard.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
@@ -135,6 +136,14 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
     std::string index(hdr[2], ' ');
     if (std::fread(index.data(), 1, hdr[2], f) != hdr[2]) { err = "dflash2: the pack's index is cut short"; return false; }
     const long data_off = 12 + (long) hdr[2];
+    // The bytes that follow the index are all any tensor may use; blob_ is sized from them (see df2_pack_guard.hpp).
+    uint64_t data_len = 0;
+    if (!df2::file_size(f, &data_len) || data_len < (uint64_t) data_off) {
+        err = "dflash2: " + path + " is shorter than its header";
+        return false;
+    }
+    data_len -= (uint64_t) data_off;
+    df2::IndexGuard guard(data_len);
     uint64_t total = 0;
     for (size_t i = 0; i < index.size();) {
         const size_t j = index.find('\n', i);
@@ -163,10 +172,14 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
                 for (const char* q = c; *q;) { taps_.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
             }
         } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            df2::TensorDecl d;
+            d.name = a; d.dtype = b; d.rows = v1; d.cols = v2; d.off = v3; d.bytes = v4;
+            uint64_t end = 0;
+            if (!guard.accept(d, &end, &err)) return false;
             Tensor t;
             t.name = a; t.dtype = b; t.rows = v1; t.cols = v2; t.off = (uint64_t) v3; t.bytes = (uint64_t) v4;
             tensors_.push_back(t);
-            total = std::max(total, t.off + t.bytes);
+            total = std::max(total, end);
         }
     }
     if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ > 8 || window_ + 16 > kRing) {

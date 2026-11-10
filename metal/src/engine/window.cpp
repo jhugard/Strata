@@ -24,6 +24,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/df2_pack_guard.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"

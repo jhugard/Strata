@@ -292,6 +292,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # the DF2P drafter pack's index: what the writer in tools/dflash2_pack.py produces must pass, and the offsets,
+  # sizes and shapes that used to reach the allocator or the tile kernels must not (synthetic index lines: no pack)
+  add_executable(df2_pack_guard_test tests/core/df2_pack_guard_test.cpp)
+  target_include_directories(df2_pack_guard_test PRIVATE include)
+  add_test(NAME df2_pack_guard_test COMMAND df2_pack_guard_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
