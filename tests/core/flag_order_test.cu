@@ -28,7 +28,11 @@ __global__ void consumer(volatile uint32_t* flag, uint32_t want, volatile uint32
     *seen = *staging;        // what the graph's PCIe group would read
 }
 
+#if defined(_WIN32)   // MSVC has no __atomic_load_n; a 0-OR is an atomic seq_cst read (flag_order.hpp's _WIN32 path)
+static uint32_t rd(volatile uint32_t* p) { return (uint32_t) _InterlockedOr((volatile long*) p, 0); }
+#else
 static uint32_t rd(volatile uint32_t* p) { return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST); }
+#endif
 
 static int run_device(int dev) {
     CK(cudaSetDevice(dev));
