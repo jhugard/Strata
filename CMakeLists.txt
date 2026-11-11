@@ -292,6 +292,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # the DeepSeek engine's Engram table header: what tools/dsv41/pack_gguf.py writes must pass, and the six values
+  # and (prime, offset) pairs that used to reach the four resizes, prod[8] or a disk read must not (no model, no GPU)
+  add_executable(ds4_engram_guard_test tests/core/ds4_engram_guard_test.cpp)
+  target_include_directories(ds4_engram_guard_test PRIVATE include)
+  add_test(NAME ds4_engram_guard_test COMMAND ds4_engram_guard_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

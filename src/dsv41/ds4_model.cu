@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_marks.hpp"
 #include "ds4_ring_link.hpp"
+#include "strata/dsv41/ds4_engram_guard.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
@@ -462,21 +463,39 @@ struct Pack {
         int32_t hdr[6];
         bool ok = std::fread(magic, 1, 4, e) == 4 && std::memcmp(magic, "DSE1", 4) == 0 &&
                   std::fread(hdr, 4, 6, e) == 6;
+        std::string eg_err;
+        strata::dsv41::EngramLayout lay;
         if (ok) {
-            eg_vocab = hdr[0], eg_layers = hdr[1], eg_ngram = hdr[2], eg_heads = hdr[3], eg_hd = hdr[4], eg_pad = hdr[5];
-            const int cols = (eg_ngram - 1) * eg_heads;
-            eg_map.resize((size_t) eg_vocab);
-            eg_mult.resize((size_t) eg_layers * eg_ngram);
-            eg_primes.resize((size_t) eg_layers * cols);
-            eg_off.resize((size_t) eg_layers * cols);
+            // The six values used to reach the four resize() calls below with nothing checking them, so a negative
+            // ngram or heads (which makes cols negative, and `(size_t) layers * cols` enormous) allocated before it
+            // failed, and any size at all could outstrip the file.  Check them against the bytes that follow the
+            // header first: see strata/dsv41/ds4_engram_guard.hpp.
+            strata::dsv41::EngramHeader h;
+            h.vocab = hdr[0], h.layers = hdr[1], h.ngram = hdr[2], h.heads = hdr[3], h.hd = hdr[4], h.pad = hdr[5];
+            uint64_t body = 0;
+            if (!strata::dsv41::body_len(e, 4 + 6 * sizeof(int32_t), &body)) {
+                eg_err = "engram.bin: too short to hold its header";
+                ok = false;
+            } else {
+                ok = strata::dsv41::EngramGuard(body).accept(h, &lay, &eg_err);
+            }
+        }
+        if (ok) {
+            eg_vocab = (int) lay.vocab, eg_layers = (int) lay.layers, eg_ngram = (int) lay.ngram,
+            eg_heads = (int) lay.heads, eg_hd = (int) lay.hd, eg_pad = (int) lay.pad;
+            eg_map.resize((size_t) lay.map_elems);
+            eg_mult.resize((size_t) lay.mult_elems);
+            eg_primes.resize((size_t) lay.table_elems);
+            eg_off.resize((size_t) lay.table_elems);
             ok = std::fread(eg_map.data(), 4, eg_map.size(), e) == eg_map.size() &&
                  std::fread(eg_mult.data(), 8, eg_mult.size(), e) == eg_mult.size() &&
                  std::fread(eg_primes.data(), 8, eg_primes.size(), e) == eg_primes.size() &&
                  std::fread(eg_off.data(), 8, eg_off.size(), e) == eg_off.size();
+            if (!ok) eg_err = d + "/engram.bin: shorter than its header implies";
         }
         std::fclose(e);
         if (!ok) {
-            err = d + "/engram.bin: unreadable";
+            err = eg_err.empty() ? d + "/engram.bin: unreadable" : eg_err;
             return false;
         }
         return true;
@@ -3480,6 +3499,23 @@ struct Model::Impl {
                           " values (not whole blocks of 32)";
                     return false;
                 }
+                // The same place to check the table's addresses as the place that already refuses a pack it cannot
+                // read.  eg_issue reads a row at `off + id * row_bytes`, with id from a (prime, offset) pair and a
+                // hash nothing bounded, so one pair could ask for bytes outside the file.  Row_bytes is the format's
+                // own row size, which is exactly what eg_issue below asks for, so rows is the file's true count.
+                const uint64_t row_bytes = fmt == 0 ? (uint64_t) pk.eg_hd / 32 * 33
+                                   : fmt == 1 ? (uint64_t) pk.eg_hd / 256 * 210
+                                   : fmt == 2 ? (uint64_t) pk.eg_hd / 32 * 18
+                                              : (uint64_t) pk.eg_hd;
+                if (tw->bytes < row_bytes || tw->bytes % row_bytes != 0) {
+                    err = "Engram layer " + id + ": " + std::to_string(tw->bytes) + " bytes of " + tw->dtype +
+                          " is not a whole number of " + std::to_string(row_bytes) + "-byte rows";
+                    return false;
+                }
+                if (!strata::dsv41::EngramGuard::pairs_in_table(
+                        pk.eg_primes, pk.eg_off, (uint64_t) li, (uint64_t) ((pk.eg_ngram - 1) * pk.eg_heads),
+                        tw->bytes / row_bytes, ("Engram layer " + id), &err))
+                    return false;
                 eg_fmt.push_back((uint8_t) fmt);
             }
             if (o.verbose)
@@ -7853,7 +7889,11 @@ struct Model::Impl {
                     rolling ^= prod[n];
                     for (int h = 0; h < pk.eg_heads; ++h) {
                         const int c = (n - 1) * pk.eg_heads + h;
-                        const int64_t id = rolling % pk.eg_primes[(size_t) li * cols + c] + pk.eg_off[(size_t) li * cols + c];
+                        // nonneg_mod, not %: the hash is an XOR of products and can be negative, and a negative id
+                        // both leaves the table below (off + a negative id) and fails the load-time check above,
+                        // which assumes id lies in [off, off + prime).
+                        const int64_t id = strata::dsv41::nonneg_mod(rolling, pk.eg_primes[(size_t) li * cols + c]) +
+                                           pk.eg_off[(size_t) li * cols + c];
                         uint8_t* rd = rd0 + (size_t) c * hd;
                         uint8_t* sd = scales + (size_t) c * (hd / 32);
                         const uint64_t key = (uint64_t) id * 8 + (uint64_t) li;
