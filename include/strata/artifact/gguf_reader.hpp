@@ -428,6 +428,10 @@ public:
         return it == meta_.end() ? nullptr : &it->second;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    /// Whether `t` has a byte count its shape really implies, and whether that count lies inside this file.
+    /// `tensor_data()` adds the declared offset with no bound of its own, so a consumer that reads a tensor
+    /// must call this first.  Defined below, next to `tensor_payload_bytes`.
+    bool in_bounds(const TensorInfo& t) const;
 
 private:
     void open() {
@@ -551,6 +555,14 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
     return blocks * (uint64_t) bb;
 }
 
+// Declared on GgufFile above, where `tensor_data()` lives.  The payload subtraction cannot wrap: the reader
+// clamps data_start_ to the file size when a shard declares no tensors.
+inline bool GgufFile::in_bounds(const TensorInfo& t) const {
+    const uint64_t bytes = tensor_payload_bytes(t);
+    const uint64_t payload = size_ - data_start_;
+    return bytes != 0 && t.offset <= payload && bytes <= payload - t.offset;
+}
+
 // The shards of one model (strata::gguf_split_paths), opened together; tensors are looked up across all of them.
 // From eddoursul/Strata 8029fa9, with the split-key validation of #255 (gopinath87607) made a property of the
 // model rather than of one loader: a split GGUF carries the model's metadata (general.architecture and the
@@ -592,12 +604,7 @@ public:
         return it->second.second;
     }
     /// Whether `t` (a tensor of shard `s`) has a known byte count that lies inside its file.
-    bool in_bounds(const TensorInfo& t, size_t s) const {
-        const GgufFile& g = *shards_[s];
-        const uint64_t bytes = tensor_payload_bytes(t);
-        const uint64_t payload = g.file_size() - g.data_start();
-        return bytes != 0 && t.offset <= payload && bytes <= payload - t.offset;
-    }
+    bool in_bounds(const TensorInfo& t, size_t s) const { return shards_[s]->in_bounds(t); }
 
 private:
     void validate_split() const {

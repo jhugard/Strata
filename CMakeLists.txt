@@ -292,6 +292,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # the byte count a tensor's shape really implies, and whether it lies inside its file: the two tensor
+  # directories --control-vector-scaled used to accept and read out of the mapping (synthetic files: no model)
+  add_executable(gguf_tensor_bounds_test tests/core/gguf_tensor_bounds_test.cpp)
+  target_link_libraries(gguf_tensor_bounds_test PRIVATE strata_artifact)
+  add_test(NAME gguf_tensor_bounds_test COMMAND gguf_tensor_bounds_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

@@ -1517,6 +1517,19 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
                     err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
                     return false;
                 }
+                // The check above is on metadata alone, and `elements()` multiplies the shape unchecked, so a
+                // shape whose product wraps round reads as exactly N f32.  `tensor_data()` then adds the
+                // declared offset to the mapping with no bound of its own.  So require the byte count the shape
+                // really implies to lie inside the file, the test native_dense.cpp, ngram.cpp and
+                // native_head.cpp all make before touching a tensor.
+                const uint64_t bytes = strata::tensor_payload_bytes(t);
+                if (!f.in_bounds(t) || bytes != (uint64_t) N * 4ull) {
+                    err = path + ": " + t.name + " does not fit in the file: " +
+                          std::to_string(bytes) + " bytes at offset " +
+                          std::to_string(t.offset) + ", but only " +
+                          std::to_string(f.file_size() - f.data_start()) + " bytes follow the header";
+                    return false;
+                }
                 const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
                 for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
                 have[(size_t) l] = true;
