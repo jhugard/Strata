@@ -2,6 +2,7 @@
 // (dequantize_row_iq2_xxs / iq2_xs / iq2_s / iq3_xxs / iq3_s / iq4_nl / iq4_xs) at 3cf03257; the K-quants and the
 // 32-blocks from Strata's include/strata/artifact/dequant.hpp (themselves transcribed from the same commit).
 #include "ref_quant.h"
+#include "gguf_tensor_bounds.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,25 +31,18 @@ const char* type_name(int t) {
     return "?";
 }
 
+// The table these two read is ref::block_geometry (gguf_tensor_bounds.h), so gguf_lite can ask the same
+// question without reaching block_bytes, which exits.  An unknown type keeps its old answers: block_elems
+// the 256 it defaulted to, block_bytes the exit(2) that the dequantizers have always made fatal.
 int block_elems(int t) {
-    switch (t) {
-        case F32: case F16: case BF16: return 1;
-        case Q4_0: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
-        case Q2_0: return 64;
-        case TQ2_T: case TQK6: case TQK7: return 128;
-        default: return 256;
-    }
+    int be = 256, bb = 0;
+    block_geometry(t, be, bb);
+    return be;
 }
 
 int block_bytes(int t) {
-    switch (t) {
-        case F32: return 4; case F16: case BF16: return 2;
-        case Q4_0: return 18; case Q5_0: return 22; case Q5_1: return 24; case Q8_0: return 34; case IQ4_NL: return 18; case Q2_0: return 18;
-        case Q3_K: return 110; case Q4_K: return 144; case Q5_K: return 176; case Q6_K: return 210;
-        case IQ2_XXS: return 66; case IQ2_XS: return 74; case IQ2_S: return 82; case IQ3_XXS: return 98;
-        case IQ3_S: return 110; case IQ4_XS: return 136; case IQ1_S: return 50; case IQ1_M: return 56;
-        case TQ2_T: return 34; case TQK6: return 26; case TQK7: return 30;
-    }
+    int be = 0, bb = 0;
+    if (block_geometry(t, be, bb)) return bb;
     std::fprintf(stderr, "ref: unknown type %d\n", t);
     std::exit(2);
 }

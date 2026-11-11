@@ -3,6 +3,7 @@
 #include "stream.h"
 
 #include "ref_quant.h"
+#include "gguf_tensor_bounds.h"
 #include "arena_budget.h"
 
 #include <sys/sysctl.h>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 
 namespace strata::metal_engine {
@@ -40,8 +42,14 @@ bool ExpertStream::wanted(const gguf::File& f, const mtl::Context& cx) {
     // 30% macOS and its file cache keep (arena_budget.h: footprint_cap).  M5 Max (115.4 GB working set, 96.2 GB cap):
     // GSQ packs, IQ3_S and UD-Q4_K_XL stay resident, UD-Q5/Q6_K_XL stream; M4 32 GB (26.8 GB): every pack streams.
     uint64_t all = 0;
-    for (const auto& kv : f.tensors)
-        if (kv.first != "per_layer_token_embd.weight") all += kv.second.bytes;
+    for (const auto& kv : f.tensors) {
+        if (kv.first == "per_layer_token_embd.weight") continue;
+        // saturating: gguf_lite bounds every tensor against the file, so only overlapping claims in a
+        // hostile file could still take this past 2^64, and a wrong stream/resident decision is the only
+        // thing the sum feeds
+        if (kv.second.bytes > (std::numeric_limits<uint64_t>::max)() - all) { all = (std::numeric_limits<uint64_t>::max)(); break; }
+        all += kv.second.bytes;
+    }
     uint64_t phys = 0;
     size_t len = sizeof phys;
     sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
@@ -191,7 +199,12 @@ bool ExpertStream::load_dense(gguf::File& f, mtl::Context& cx, const std::vector
         if (t.name == "per_layer_token_embd.weight") continue;
         if (std::find(skip.begin(), skip.end(), t.name) != skip.end()) { t.offset = 0; continue; }
         ts.push_back(&t);
-        tot += (t.bytes + 255) / 256 * 256;
+        // gguf_lite refuses a tensor that runs past its file, so each term is at most the file's size; the
+        // sum is still checked, because a wrapped `tot` would size the allocation below while every per-
+        // tensor read copies its own (larger) byte count.
+        const uint64_t pad = gguf::pad_up256(t.bytes);
+        if (pad == 0 || pad > (std::numeric_limits<uint64_t>::max)() - tot) { err = "metal stream: the dense tensors' total size overflows"; return false; }
+        tot += pad;
     }
     out = cx.alloc((tot + PAGE - 1) / PAGE * PAGE);
     std::vector<uint64_t> src(ts.size()), dst(ts.size());

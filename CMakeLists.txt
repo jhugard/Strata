@@ -292,6 +292,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # the Metal reader's tensor sizing and bounds arithmetic: overflowed shapes, partial rows, unknown types,
+  # offsets past EOF (header-only, no Metal, no GPU, no model - metal/src/gguf_tensor_bounds.h)
+  add_executable(metal_tensor_bounds_test tests/core/metal_tensor_bounds_test.cpp)
+  target_include_directories(metal_tensor_bounds_test PRIVATE metal/src)
+  target_link_libraries(metal_tensor_bounds_test PRIVATE strata_warnings)
+  add_test(NAME metal_tensor_bounds_test COMMAND metal_tensor_bounds_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

@@ -2,6 +2,7 @@
 #include "gguf_lite.h"
 
 #include "ref_quant.h"
+#include "gguf_tensor_bounds.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -10,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace gguf {
 
@@ -98,13 +100,28 @@ bool File::open(const std::string& p, std::string& err) {
         ts.push_back(t);
     }
     if (!r.ok) { err = "truncated GGUF header"; return false; }
+    if (align == 0) { err = "GGUF: general.alignment is 0"; return false; }   // the rounding below divides by it
     const uint64_t pos = (uint64_t)(r.p - (const uint8_t*)map);
-    const uint64_t data = (pos + align - 1) / align * align;
+    uint64_t data = align - 1 > (std::numeric_limits<uint64_t>::max)() - pos ? file_bytes : (pos + align - 1) / align * align;
+    // A file whose header runs to EOF has no data section.  Nothing can be read from it, and clamping the
+    // start keeps `file_bytes - data` (the bound every tensor is checked against below) at 0 instead of
+    // wrapping it to a huge number that bounds nothing.
+    if (data > file_bytes) data = file_bytes;
+    const uint64_t payload = file_bytes > data ? (uint64_t)file_bytes - data : 0;
     for (Tensor& t : ts) {
+        // A shape, type or offset an attacker wrote must be refused here, not followed: bytes came from
+        // n * block_bytes with no check on the product, and no tensor was ever compared with the file.  A
+        // tensor that does not fit is named and the file refused (the same rule as the CUDA / CPU reader).
+        t.bytes = tensor_payload_bytes(t.type, t.shape);
+        if (t.bytes == 0) {
+            err = "GGUF: tensor " + t.name + " has a shape, a row length or a type this build cannot size";
+            return false;
+        }
+        if (!tensor_in_bounds(t.offset, t.bytes, payload)) {
+            err = "GGUF: tensor " + t.name + " runs past the end of the file (a truncated file?)";
+            return false;
+        }
         t.offset += data;
-        uint64_t n = 1;
-        for (uint64_t d : t.shape) n *= d;
-        t.bytes = n / ref::block_elems(t.type) * ref::block_bytes(t.type);
         tensors[t.name] = t;
     }
     return true;
